@@ -357,42 +357,45 @@ NodeID ClusterMatching::computeClusteringV2(const Hypergraph& hg,
     return new_cluster_count;
 }
 
-bool ClusterMatching::adjMatchAreaJudging(const Hypergraph& hg,
-                                          size_t cluster_size,
-                                          Weight cluster_weight,
-                                          Weight node_weight) const {
-    // If cluster has only 2 nodes, always allow joining
-    if (cluster_size <= 2) {
-        return true;
-    }
-    
-    // For larger clusters, apply constraints
-    // Limit cluster size to prevent too aggressive clustering
-    constexpr size_t kMaxClusterSize = 4;
-    if (cluster_size >= kMaxClusterSize) {
-        return false;
-    }
-    else
-    {
-        return true;
-    }
-    
-    // Limit cluster weight (prevent very heavy clusters)
-    // Use average node weight as reference
-    Weight avg_weight = hg.getTotalNodeWeight() / hg.getNumNodes();
-    Weight max_cluster_weight = avg_weight * kMaxClusterSize;
-    
-    if (cluster_weight + node_weight > max_cluster_weight) {
-        return false;
-    }
-    
-    return true;
-}
+/*
+ * Reserved for future cluster-area extension.
+ * Currently not used by computeClusteringV2.
+ *
+ * bool ClusterMatching::adjMatchAreaJudging(const Hypergraph& hg,
+ *                                           size_t cluster_size,
+ *                                           Weight cluster_weight,
+ *                                           Weight node_weight) const {
+ *     // If cluster has only 2 nodes, always allow joining
+ *     if (cluster_size <= 2) {
+ *         return true;
+ *     }
+ *
+ *     // For larger clusters, apply constraints
+ *     // Limit cluster size to prevent too aggressive clustering
+ *     constexpr size_t kMaxClusterSize = 4;
+ *     if (cluster_size >= kMaxClusterSize) {
+ *         return false;
+ *     } else {
+ *         return true;
+ *     }
+ *
+ *     // Limit cluster weight (prevent very heavy clusters)
+ *     // Use average node weight as reference
+ *     Weight avg_weight = hg.getTotalNodeWeight() / hg.getNumNodes();
+ *     Weight max_cluster_weight = avg_weight * kMaxClusterSize;
+ *
+ *     if (cluster_weight + node_weight > max_cluster_weight) {
+ *         return false;
+ *     }
+ *
+ *     return true;
+ * }
+ */
 
 void ClusterMatching::buildCoarseNets(const Hypergraph& fine_hg,
                                       const std::vector<NodeID>& node_mapping,
                                       Hypergraph& coarse_hg) {
-    uint64_t kMaxCoarseNetSize = std::max(config_.large_net_threshold, (uint64_t)300);
+    const uint64_t max_coarse_net_size = std::max(config_.large_net_threshold, static_cast<uint64_t>(300));
 
     // Hash function for vector of sorted node IDs
     struct VectorHash {
@@ -404,23 +407,22 @@ void ClusterMatching::buildCoarseNets(const Hypergraph& fine_hg,
             return hash;
         }
     };
+    const VectorHash vector_hash;
     
-    // Use vector of pair to store nets with their weights (avoid second lookup)
-    std::unordered_map<std::vector<NodeID>, size_t, VectorHash> net_to_idx;
-    net_to_idx.reserve(fine_hg.getNumNets() / 2);
+    // Map hash -> candidate net indices (collision-resolved by exact vector compare).
+    // This avoids storing a second full vector copy as unordered_map key.
+    std::unordered_map<size_t, std::vector<size_t>> hash_to_indices;
+    hash_to_indices.reserve(fine_hg.getNumNets() / 2);
     
     std::vector<std::vector<NodeID>> net_keys;
     std::vector<Weight> net_weights;
     net_keys.reserve(fine_hg.getNumNets() / 2);
     net_weights.reserve(fine_hg.getNumNets() / 2);
     
-    size_t parallel_net_count = 0;
-    
     // Reusable buffer to avoid repeated allocations
     std::vector<NodeID> coarse_nodes_buf;
-    coarse_nodes_buf.reserve(kMaxCoarseNetSize);
+    coarse_nodes_buf.reserve(max_coarse_net_size);
     
-    int num_nodes = fine_hg.getNumNodes();
     for (EdgeID fine_net = 0; fine_net < fine_hg.getNumNets(); ++fine_net) {
         coarse_nodes_buf.clear();
         
@@ -433,31 +435,60 @@ void ClusterMatching::buildCoarseNets(const Hypergraph& fine_hg,
         }
         
         if (coarse_nodes_buf.size() <= 1) continue;
-        if (coarse_nodes_buf.size() > kMaxCoarseNetSize) continue;
-  
-        // Sort and remove duplicates (faster than unordered_set for small sizes)
-        std::sort(coarse_nodes_buf.begin(), coarse_nodes_buf.end());
-        auto last = std::unique(coarse_nodes_buf.begin(), coarse_nodes_buf.end());
-        
-            coarse_nodes_buf.erase(last, coarse_nodes_buf.end());
-        if (coarse_nodes_buf.size() <= 1) continue;
-        // Check for parallel net
-        auto it = net_to_idx.find(coarse_nodes_buf);
-        if (it != net_to_idx.end()) {
-            // Parallel net found, merge weights
-            net_weights[it->second] += fine_hg.getNetWeight(fine_net);
-            parallel_net_count++;
+        if (coarse_nodes_buf.size() > max_coarse_net_size) continue;
+
+        // Fast path for 2-pin nets (common case): avoid generic sort/unique.
+        if (coarse_nodes_buf.size() == 2) {
+            NodeID a = coarse_nodes_buf[0];
+            NodeID b = coarse_nodes_buf[1];
+            if (a == b) {
+                continue;
+            }
+            if (a > b) {
+                std::swap(a, b);
+            }
+            coarse_nodes_buf[0] = a;
+            coarse_nodes_buf[1] = b;
         } else {
-            // New net
-            size_t idx = net_keys.size();
-            net_to_idx[coarse_nodes_buf] = idx;
+            // Sort and remove duplicates (faster than unordered_set for small sizes)
+            std::sort(coarse_nodes_buf.begin(), coarse_nodes_buf.end());
+            auto last = std::unique(coarse_nodes_buf.begin(), coarse_nodes_buf.end());
+            coarse_nodes_buf.erase(last, coarse_nodes_buf.end());
+        }
+        if (coarse_nodes_buf.size() <= 1) continue;
+
+        // Check for parallel net by hash bucket + exact compare.
+        const size_t key_hash = vector_hash(coarse_nodes_buf);
+        auto bucket_it = hash_to_indices.find(key_hash);
+        size_t matched_idx = static_cast<size_t>(-1);
+        if (bucket_it != hash_to_indices.end()) {
+            const std::vector<size_t>& candidates = bucket_it->second;
+            for (size_t idx : candidates) {
+                const std::vector<NodeID>& existing_key = net_keys[idx];
+                if (existing_key.size() == coarse_nodes_buf.size() &&
+                    std::equal(existing_key.begin(), existing_key.end(),
+                               coarse_nodes_buf.begin())) {
+                    matched_idx = idx;
+                    break;
+                }
+            }
+        }
+
+        if (matched_idx != static_cast<size_t>(-1)) {
+            // Parallel net found, merge weights.
+            net_weights[matched_idx] += fine_hg.getNetWeight(fine_net);
+        } else {
+            // New net (preserve first-seen order for deterministic net IDs).
+            const size_t idx = net_keys.size();
             net_keys.push_back(coarse_nodes_buf);
             net_weights.push_back(fine_hg.getNetWeight(fine_net));
+            auto insert_result = hash_to_indices.emplace(key_hash, std::vector<size_t>());
+            insert_result.first->second.push_back(idx);
         }
     }
     
     // Add nets to coarse graph
-    coarse_hg.reserveNets(fine_hg.getNumNets());
+    coarse_hg.reserveNets(net_keys.size());
     for (size_t i = 0; i < net_keys.size(); ++i) {
         EdgeID coarse_net = coarse_hg.addNet(net_weights[i], false);
         for (NodeID coarse_node : net_keys[i]) {
@@ -475,4 +506,3 @@ bool ClusterMatching::adjMatchAreaJudging(const Hypergraph& hg, NodeID node1, No
     return true;
 }
 } // namespace consmlp
-

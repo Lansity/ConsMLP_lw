@@ -120,18 +120,15 @@ private:
     NodeID computeClusteringV2(const Hypergraph& hg,
                                std::vector<NodeID>& cluster_id);
 
-    /**
-     * @brief Judge if a node can be added to an existing cluster
-     * @param hg Hypergraph
-     * @param cluster_size Current size of the cluster
-     * @param cluster_weight Current total weight of the cluster
-     * @param node_weight Weight of node to add
-     * @return True if node can join the cluster
+    /*
+     * Reserved for future cluster-area extension.
+     * Currently computeClusteringV2 does not use this overload.
+     *
+     * bool adjMatchAreaJudging(const Hypergraph& hg,
+     *                          size_t cluster_size,
+     *                          Weight cluster_weight,
+     *                          Weight node_weight) const;
      */
-    bool adjMatchAreaJudging(const Hypergraph& hg,
-                             size_t cluster_size,
-                             Weight cluster_weight,
-                             Weight node_weight) const;
 
     /**
      * @brief Judge if two unclustered nodes can be matched (weight check)

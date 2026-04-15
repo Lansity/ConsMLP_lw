@@ -1779,76 +1779,127 @@ Partition MultilevelPartitionerApp::runInitialPartitioning(
     int discarded_trials = 0;
     int total_trials = 0;
     
-    // Create GreedyFMRefiner for initial partition (ConsMLP_lw: FMRefiner removed)
+    // Create trial refine config (each trial uses its own refiner instance)
     Configuration init_refine_config = config_;
     init_refine_config.max_refinement_passes = 20;  // More passes for better quality
-    auto trial_refiner = std::unique_ptr<Refiner>(new GreedyFMRefiner(init_refine_config));
     
     // For balance enforcement, use type-based balancing if using types OR xml mode
     bool use_type_balancing = use_type_constraints || coarsest_constraints.isXMLConstraintMode();
-    
-    // Helper lambda - returns true if trial is valid (balanced)
-    auto runTrial = [&](Partition trial_partition, const std::string& method_name, int trial_idx) -> bool {
-        // Try to enforce balance constraints before refinement, but keep the
-        // trial as a fallback candidate if we still cannot satisfy constraints.
-        if (!coarsest_constraints.isBalanced(trial_partition, coarsest_hg)) {
-            if (!enforceBalanceConstraints(coarsest_hg, trial_partition,
-                                           coarsest_constraints, use_type_balancing)) {
-                std::cout << method_name << " trial " << trial_idx
-                          << " starts imbalanced; keeping as fallback candidate" << std::endl;
+
+    // Precompute levels and projection maps once.
+    const int trial_levels = coarsest_level - trial_stop_level + 1;
+    std::vector<const Hypergraph*> trial_level_hgs;
+    trial_level_hgs.reserve(trial_levels);
+    for (int level = coarsest_level; level >= trial_stop_level; --level) {
+        trial_level_hgs.push_back(&hierarchy.getLevel(level).getHypergraph());
+    }
+
+    std::vector<std::vector<NodeID>> projection_maps;
+    if (trial_levels > 1) {
+        projection_maps.reserve(static_cast<size_t>(trial_levels - 1));
+        for (int level = coarsest_level - 1; level >= trial_stop_level; --level) {
+            const Hypergraph& level_hg = hierarchy.getLevel(level).getHypergraph();
+            std::vector<NodeID> map(level_hg.getNumNodes(), INVALID_NODE);
+            for (NodeID node_id = 0; node_id < level_hg.getNumNodes(); ++node_id) {
+                map[node_id] = hierarchy.getLevel(level).getCoarserNode(node_id);
+            }
+            projection_maps.push_back(std::move(map));
+        }
+    }
+
+    struct TrialInput {
+        std::string method_name;
+        int trial_idx;
+        Partition partition;
+
+        TrialInput(const std::string& name, int idx, Partition&& p)
+            : method_name(name)
+            , trial_idx(idx)
+            , partition(std::move(p))
+        {}
+    };
+
+    struct TrialResult {
+        std::string method_name;
+        int trial_idx;
+        Partition partition;
+        Weight initial_cut;
+        Weight final_cut;
+        bool starts_imbalanced;
+        bool start_balance_fixed;
+        bool valid;
+        bool final_balance_fixed;
+
+        TrialResult(NodeID num_nodes, PartitionID num_parts)
+            : trial_idx(-1)
+            , partition(num_nodes, num_parts)
+            , initial_cut(0)
+            , final_cut(std::numeric_limits<Weight>::max())
+            , starts_imbalanced(false)
+            , start_balance_fixed(false)
+            , valid(false)
+            , final_balance_fixed(false)
+        {}
+    };
+
+    auto evaluateTrial = [&](const TrialInput& input) -> TrialResult {
+        TrialResult result(eval_hg.getNumNodes(), config_.num_partitions);
+        result.method_name = input.method_name;
+        result.trial_idx = input.trial_idx;
+
+        Partition trial_partition = input.partition;
+
+        // Step 1: enforce coarse-level balance before refinement if needed.
+        result.starts_imbalanced = !coarsest_constraints.isBalanced(trial_partition, coarsest_hg);
+        result.start_balance_fixed = !result.starts_imbalanced;
+        if (result.starts_imbalanced) {
+            if (enforceBalanceConstraints(coarsest_hg, trial_partition,
+                                          coarsest_constraints, use_type_balancing)) {
+                result.start_balance_fixed = true;
             }
         }
 
-        // Calculate initial cut size BEFORE refinement
-        Weight initial_cut = PartitionMetrics::calculateCutSize(coarsest_hg, trial_partition);
+        // Step 2: trial refinement from coarsest down to trial_stop_level.
+        result.initial_cut = PartitionMetrics::calculateCutSize(coarsest_hg, trial_partition);
 
-        trial_refiner->refine(coarsest_hg, trial_partition, level_constraints_cache[0]);
+        GreedyFMRefiner trial_refiner(init_refine_config);
+        trial_refiner.refine(coarsest_hg, trial_partition, level_constraints_cache[0]);
 
-        int constraint_idx = 1;
-        for (int level = coarsest_level - 1; level >= trial_stop_level; --level, ++constraint_idx) {
-            const Hypergraph& level_hg = hierarchy.getLevel(level).getHypergraph();
+        for (int idx = 1; idx < trial_levels; ++idx) {
+            const Hypergraph& level_hg = *trial_level_hgs[idx];
+            const std::vector<NodeID>& map = projection_maps[idx - 1];
 
             Partition new_partition(level_hg.getNumNodes(), config_.num_partitions);
             for (NodeID node_id = 0; node_id < level_hg.getNumNodes(); ++node_id) {
-                NodeID coarse_node = hierarchy.getLevel(level).getCoarserNode(node_id);
+                NodeID coarse_node = map[node_id];
                 if (coarse_node != INVALID_NODE) {
                     PartitionID part = trial_partition.getPartition(coarse_node);
                     new_partition.setPartition(node_id, part, level_hg);
                 }
             }
             trial_partition = std::move(new_partition);
-            trial_refiner->refine(level_hg, trial_partition, level_constraints_cache[constraint_idx]);
+            trial_refiner.refine(level_hg, trial_partition, level_constraints_cache[idx]);
         }
 
-        // Calculate final cut size AFTER refinement
-        Weight final_cut = PartitionMetrics::calculateCutSize(eval_hg, trial_partition);
-
-        // Check final balance after refinement - try to fix if violates
+        // Step 3: balance check at eval level.
+        result.final_cut = PartitionMetrics::calculateCutSize(eval_hg, trial_partition);
+        result.valid = true;
         if (!eval_constraints.isBalanced(trial_partition, eval_hg)) {
             if (!enforceBalanceConstraints(eval_hg, trial_partition,
                                            eval_constraints, use_type_balancing)) {
-                if (final_cut < best_imbalanced_cut) {
-                    best_imbalanced_cut = final_cut;
-                    best_imbalanced_partition = trial_partition;
-                }
-                std::cout << method_name << " trial " << trial_idx << " discarded (final imbalance)" << std::endl;
-                eval_constraints.printConstraintViolations(trial_partition, eval_hg);
-                return false;
+                result.valid = false;
+            } else {
+                result.final_balance_fixed = true;
+                result.final_cut = PartitionMetrics::calculateCutSize(eval_hg, trial_partition);
             }
-            // Recalculate after successful balancing moves.
-            final_cut = PartitionMetrics::calculateCutSize(eval_hg, trial_partition);
         }
 
-        std::cout << method_name << " trial " << trial_idx
-                  << " cut: " << initial_cut << " -> " << final_cut
-                  << " (improve: " << (initial_cut - final_cut) << ")" << std::endl;
-        if (final_cut < best_cut) {
-            best_cut = final_cut;
-            best_partition = trial_partition;
-            best_trial_level = trial_stop_level;
-        }
-        return true;
+        result.partition = std::move(trial_partition);
+        return result;
     };
+
+    std::vector<TrialInput> trial_inputs;
+    trial_inputs.reserve(static_cast<size_t>(config_.initial_partition_runs + 16));
     
     if (use_rand) {
         int kNumRandomTrials = config_.initial_partition_runs;
@@ -1860,12 +1911,7 @@ Partition MultilevelPartitionerApp::runInitialPartitioning(
             
             RandomPartitioner random_partitioner(trial_config);
             Partition trial_partition = random_partitioner.partition(coarsest_hg, coarsest_constraints);
-            total_trials++;
-            if (runTrial(std::move(trial_partition), "Random", trial)) {
-                valid_trials++;
-            } else {
-                discarded_trials++;
-            }
+            trial_inputs.push_back(TrialInput("Random", trial, std::move(trial_partition)));
         }
     }
     
@@ -1878,12 +1924,7 @@ Partition MultilevelPartitionerApp::runInitialPartitioning(
             
             GHGPartitioner ghg_partitioner(trial_config);
             Partition ghg_partition = ghg_partitioner.partition(coarsest_hg, coarsest_constraints);
-            total_trials++;
-            if (runTrial(std::move(ghg_partition), "GHG", trial)) {
-                valid_trials++;
-            } else {
-                discarded_trials++;
-            }
+            trial_inputs.push_back(TrialInput("GHG", trial, std::move(ghg_partition)));
         }
     }
     
@@ -1896,27 +1937,117 @@ Partition MultilevelPartitionerApp::runInitialPartitioning(
             
             GHGOptPartitioner ghg_opt_partitioner(trial_config);
             Partition ghg_opt_partition = ghg_opt_partitioner.partition(coarsest_hg, coarsest_constraints);
-            total_trials++;
-            if (runTrial(std::move(ghg_opt_partition), "GHG_Opt", trial)) {
-                valid_trials++;
-            } else {
-                discarded_trials++;
-            }
+            trial_inputs.push_back(TrialInput("GHG_Opt", trial, std::move(ghg_opt_partition)));
         }
     }
 
     // Guard against mode/parameter combinations that produce zero trials
     // (e.g. k>2 with init=ghg).
-    if (total_trials == 0 || best_cut == std::numeric_limits<Weight>::max()) {
+    bool inserted_fallback_due_empty_inputs = false;
+    if (trial_inputs.empty()) {
         std::cout << "[WARNING] No feasible trial found from selected init mode; "
                   << "running greedy fallback." << std::endl;
         GreedyPartitioner greedy_partitioner(config_);
         Partition greedy_partition = greedy_partitioner.partition(coarsest_hg, coarsest_constraints);
-        total_trials++;
-        if (runTrial(std::move(greedy_partition), "GreedyFallback", 0)) {
-            valid_trials++;
-        } else {
+        trial_inputs.push_back(TrialInput("GreedyFallback", 0, std::move(greedy_partition)));
+        inserted_fallback_due_empty_inputs = true;
+    }
+
+    total_trials = static_cast<int>(trial_inputs.size());
+
+    // Evaluate all trials, then finalize best selection.
+    std::vector<TrialResult> trial_results;
+    trial_results.reserve(trial_inputs.size());
+
+    const bool run_parallel_trials = (trial_inputs.size() > 1);
+    if (run_parallel_trials) {
+        std::vector<std::future<TrialResult>> futures;
+        futures.reserve(trial_inputs.size());
+        for (size_t i = 0; i < trial_inputs.size(); ++i) {
+            futures.push_back(std::async(std::launch::async, evaluateTrial,
+                                         std::cref(trial_inputs[i])));
+        }
+        for (size_t i = 0; i < futures.size(); ++i) {
+            trial_results.push_back(futures[i].get());
+        }
+    } else {
+        trial_results.push_back(evaluateTrial(trial_inputs[0]));
+    }
+
+    // Optional detailed violation dump for debugging. Disabled by default for runtime.
+    const bool print_trial_violations = (std::getenv("CONSMLP_PRINT_TRIAL_VIOLATIONS") != nullptr);
+
+    // Unified result handling in deterministic trial order.
+    for (size_t i = 0; i < trial_results.size(); ++i) {
+        TrialResult& result = trial_results[i];
+        if (result.starts_imbalanced && !result.start_balance_fixed) {
+            std::cout << result.method_name << " trial " << result.trial_idx
+                      << " starts imbalanced; keeping as fallback candidate" << std::endl;
+        }
+
+        if (!result.valid) {
+            if (result.final_cut < best_imbalanced_cut) {
+                best_imbalanced_cut = result.final_cut;
+                best_imbalanced_partition = result.partition;
+            }
+            std::cout << result.method_name << " trial " << result.trial_idx
+                      << " discarded (final imbalance)" << std::endl;
+            if (print_trial_violations) {
+                eval_constraints.printConstraintViolations(result.partition, eval_hg);
+            }
             discarded_trials++;
+            continue;
+        }
+
+        std::cout << result.method_name << " trial " << result.trial_idx
+                  << " cut: " << result.initial_cut << " -> " << result.final_cut
+                  << " (improve: " << (result.initial_cut - result.final_cut) << ")" << std::endl;
+        if (result.final_cut < best_cut) {
+            best_cut = result.final_cut;
+            best_partition = result.partition;
+            best_trial_level = trial_stop_level;
+        }
+        valid_trials++;
+    }
+
+    // Preserve original behavior: if no valid trial was found, run one greedy
+    // fallback trial even when initial trial inputs were non-empty.
+    if (best_cut == std::numeric_limits<Weight>::max() && !inserted_fallback_due_empty_inputs) {
+        std::cout << "[WARNING] No feasible trial found from selected init mode; "
+                  << "running greedy fallback." << std::endl;
+        GreedyPartitioner greedy_partitioner(config_);
+        Partition greedy_partition = greedy_partitioner.partition(coarsest_hg, coarsest_constraints);
+
+        TrialInput greedy_input("GreedyFallback", 0, std::move(greedy_partition));
+        TrialResult greedy_result = evaluateTrial(greedy_input);
+        total_trials++;
+
+        if (greedy_result.starts_imbalanced && !greedy_result.start_balance_fixed) {
+            std::cout << greedy_result.method_name << " trial " << greedy_result.trial_idx
+                      << " starts imbalanced; keeping as fallback candidate" << std::endl;
+        }
+
+        if (!greedy_result.valid) {
+            if (greedy_result.final_cut < best_imbalanced_cut) {
+                best_imbalanced_cut = greedy_result.final_cut;
+                best_imbalanced_partition = greedy_result.partition;
+            }
+            std::cout << greedy_result.method_name << " trial " << greedy_result.trial_idx
+                      << " discarded (final imbalance)" << std::endl;
+            if (print_trial_violations) {
+                eval_constraints.printConstraintViolations(greedy_result.partition, eval_hg);
+            }
+            discarded_trials++;
+        } else {
+            std::cout << greedy_result.method_name << " trial " << greedy_result.trial_idx
+                      << " cut: " << greedy_result.initial_cut << " -> " << greedy_result.final_cut
+                      << " (improve: " << (greedy_result.initial_cut - greedy_result.final_cut) << ")" << std::endl;
+            if (greedy_result.final_cut < best_cut) {
+                best_cut = greedy_result.final_cut;
+                best_partition = greedy_result.partition;
+                best_trial_level = trial_stop_level;
+            }
+            valid_trials++;
         }
     }
 
