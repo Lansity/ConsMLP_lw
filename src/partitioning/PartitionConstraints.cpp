@@ -17,6 +17,7 @@ PartitionConstraints::PartitionConstraints(PartitionID num_partitions,
     , capacity_constraints_(num_partitions, 
                            std::vector<CapacityConstraint>(NUM_TYPES))
 {
+    (void)config;
 }
 
 void PartitionConstraints::initializeBalanced(const Hypergraph& hg,
@@ -198,28 +199,9 @@ bool PartitionConstraints::wouldViolateCapacityMultiType(
     return false;  // No constraints would be violated
 }
 
-bool PartitionConstraints::satisfiesMinimum(const Partition& partition,
-                                           PartitionID partition_id,
-                                           const Hypergraph& hg) const {
-    // Check each node type
-    for (size_t type_idx = 0; type_idx < NUM_TYPES; ++type_idx) {
-        NodeType type = static_cast<NodeType>(type_idx);
-        CapacityConstraint constraint = 
-            capacity_constraints_[partition_id][type_idx];
-        
-        Weight current_weight = partition.getPartitionWeightByType(
-            partition_id, type);
-        
-        if (current_weight < constraint.min_capacity) {
-            return false;
-        }
-    }
-    
-    return true;
-}
-
 bool PartitionConstraints::isBalanced(const Partition& partition,
                                      const Hypergraph& hg) const {
+    (void)hg;
     // Check all partitions satisfy constraints
     for (PartitionID part_id = 0; part_id < num_partitions_; ++part_id) {
         for (size_t type_idx = 0; type_idx < NUM_TYPES; ++type_idx) {
@@ -371,6 +353,7 @@ PartitionID PartitionConstraints::initializeFromXML(const std::string& xml_filen
 }
 
 void PartitionConstraints::printConstraintSummary(const Hypergraph& hg) const {
+    (void)hg;
     std::cout << "\n========== Partition Constraints ==========" << std::endl;
     
     if (xml_constraint_mode_) {
@@ -421,6 +404,7 @@ void PartitionConstraints::printConstraintSummary(const Hypergraph& hg) const {
 
 void PartitionConstraints::printConstraintViolations(const Partition& partition,
                                                      const Hypergraph& hg) const {
+    (void)hg;
     std::cout << "[Constraint Violation Details]" << std::endl;
     
     bool has_violation = false;

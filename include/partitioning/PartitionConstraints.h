@@ -141,10 +141,6 @@ public:
                                        const TypeWeights& type_weights,
                                        const Partition& partition) const;
 
-    bool satisfiesMinimum(const Partition& partition,
-                         PartitionID partition_id,
-                         const Hypergraph& hg) const;
-
     bool isBalanced(const Partition& partition, const Hypergraph& hg) const;
 
     inline PartitionID getNumPartitions() const { return num_partitions_; }

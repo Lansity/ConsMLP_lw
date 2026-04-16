@@ -3,7 +3,6 @@
 
 #include "utils/Types.h"
 #include "utils/Configuration.h"
-#include "utils/Profiler.h"
 #include "datastructures/Hypergraph.h"
 #include "datastructures/HypergraphHierarchy.h"
 #include <vector>
@@ -48,12 +47,10 @@ public:
      * @brief Coarsen a hypergraph and add to hierarchy
      * @param hierarchy Hypergraph hierarchy
      * @param level_idx Current level index (fine level)
-     * @param profiler Optional profiler
      * @return Coarsening statistics
      */
     virtual CoarseningStats coarsen(HypergraphHierarchy& hierarchy,
-                                   uint32_t level_idx,
-                                   Profiler* profiler = nullptr) = 0;
+                                   uint32_t level_idx) = 0;
 
     virtual const char* getName() const = 0;
 
@@ -98,8 +95,7 @@ public:
     explicit ClusterMatching(const Configuration& config);
 
     CoarseningStats coarsen(HypergraphHierarchy& hierarchy,
-                           uint32_t level_idx,
-                           Profiler* profiler = nullptr) override;
+                           uint32_t level_idx) override;
 
     const char* getName() const override { return "ClusterMatching"; }
 

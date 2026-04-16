@@ -130,35 +130,6 @@ Hypergraph buildSubHypergraph(const Hypergraph& parent,
                               const std::vector<NodeID>& subset);
 
 /**
- * @brief Run a full multilevel bipartition (coarsen→initial→refine)
- * @param hg Input hypergraph (consumed)
- * @param config Configuration
- * @param coarsen_algo Coarsening algorithm name
- * @param refine_algo Refinement algorithm name
- * @param init_mode Initial partitioning mode
- * @param use_type_constraints Enable per-type constraints
- * @param relaxed_multiplier Imbalance relaxation for DSP/BRAM/IO
- * @param xml_constraints Aggregated XML constraints (nullptr = balance/types mode)
- * @param debug_depth Recursion depth for debug output
- * @param debug_part_start Start partition ID for debug output
- * @param debug_part_end End partition ID for debug output
- * @param stats Output statistics
- * @return Resulting bipartition
- */
-Partition runDirectBipartition(Hypergraph&& hg,
-                               const Configuration& config,
-                               const std::string& coarsen_algo,
-                               const std::string& refine_algo,
-                               const std::string& init_mode,
-                               bool use_type_constraints,
-                               double relaxed_multiplier,
-                               const PartitionConstraints* xml_constraints,
-                               int debug_depth,
-                               PartitionID debug_part_start,
-                               PartitionID debug_part_end,
-                               BipartitionStats& stats);
-
-/**
  * @brief Recursive bipartition using sequential (1 vs k-1) splitting
  *
  * At each call, the subset is split into left (1 final partition) and

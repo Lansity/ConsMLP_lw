@@ -54,6 +54,23 @@ double getTypeImbalance(NodeType type,
     return type_imbalance;
 }
 
+PartitionConstraints buildLevelConstraints(const Configuration& config,
+                                           PartitionID num_partitions,
+                                           const Hypergraph& level_hg,
+                                           const PartitionConstraints* fixed_constraints,
+                                           bool use_type_constraints,
+                                           double relaxed_multiplier) {
+    PartitionConstraints constraints(num_partitions, config);
+    if (fixed_constraints != nullptr) {
+        constraints = *fixed_constraints;
+    } else if (use_type_constraints) {
+        constraints.initializeBalancedWithTypes(level_hg, config.imbalance_factor, relaxed_multiplier);
+    } else {
+        constraints.initializeBalanced(level_hg, config.imbalance_factor);
+    }
+    return constraints;
+}
+
 Hypergraph buildSubHypergraph(const Hypergraph& parent,
                               const std::vector<NodeID>& subset) {
     Hypergraph sub(subset.size(), parent.getNumNets());
@@ -114,6 +131,7 @@ Partition runDirectBipartition(Hypergraph&& hg,
     local_config.num_partitions = 2;  // Force bipartition
     const bool has_custom_constraints = (xml_constraints != nullptr);
     const bool is_xml_constraints = has_custom_constraints && xml_constraints->isXMLConstraintMode();
+    const PartitionConstraints* fixed_constraints = has_custom_constraints ? xml_constraints : nullptr;
     
     stats.num_nodes = hg.getNumNodes();
     stats.num_nets = hg.getNumNets();
@@ -123,7 +141,7 @@ Partition runDirectBipartition(Hypergraph&& hg,
     coarsen_timer.start();
     
     auto coarsener = createCoarsener(coarsen_algo, local_config);
-    MultilevelCoarsener ml_coarsener(local_config, std::move(coarsener));
+    MultilevelCoarsener ml_coarsener(std::move(coarsener));
     // Silent mode for recursive bipartition (output is collected and printed at the end)
     HypergraphHierarchy hierarchy = ml_coarsener.coarsen(std::move(hg), true);
     
@@ -141,15 +159,12 @@ Partition runDirectBipartition(Hypergraph&& hg,
     int trial_stop_level = std::max(0, coarsest_level - num_trial_refine_levels);
     const Hypergraph& eval_hg = hierarchy.getLevel(trial_stop_level).getHypergraph();
     
-    PartitionConstraints coarsest_constraints(2, local_config);
-    if (has_custom_constraints) {
-        // Use precomputed constraints directly (XML-aggregated or proportional recursive split)
-        coarsest_constraints = *xml_constraints;
-    } else if (use_type_constraints) {
-        coarsest_constraints.initializeBalancedWithTypes(coarsest_hg, local_config.imbalance_factor, relaxed_multiplier);
-    } else {
-        coarsest_constraints.initializeBalanced(coarsest_hg, local_config.imbalance_factor);
-    }
+    PartitionConstraints coarsest_constraints = buildLevelConstraints(local_config,
+                                                                     2,
+                                                                     coarsest_hg,
+                                                                     fixed_constraints,
+                                                                     use_type_constraints,
+                                                                     relaxed_multiplier);
     
     // Debug: print constraints for this bipartition when custom constraints are injected.
     if (has_custom_constraints) {
@@ -174,14 +189,12 @@ Partition runDirectBipartition(Hypergraph&& hg,
     level_constraints_cache.reserve(num_trial_refine_levels + 1);
     for (int level = coarsest_level; level >= trial_stop_level; --level) {
         const Hypergraph& level_hg = hierarchy.getLevel(level).getHypergraph();
-        PartitionConstraints constraints(2, local_config);
-        if (has_custom_constraints) {
-            constraints = *xml_constraints;
-        } else if (use_type_constraints) {
-            constraints.initializeBalancedWithTypes(level_hg, local_config.imbalance_factor, relaxed_multiplier);
-        } else {
-            constraints.initializeBalanced(level_hg, local_config.imbalance_factor);
-        }
+        PartitionConstraints constraints = buildLevelConstraints(local_config,
+                                                                 2,
+                                                                 level_hg,
+                                                                 fixed_constraints,
+                                                                 use_type_constraints,
+                                                                 relaxed_multiplier);
         level_constraints_cache.push_back(std::move(constraints));
     }
     
@@ -200,14 +213,12 @@ Partition runDirectBipartition(Hypergraph&& hg,
     auto trial_refiner = std::unique_ptr<Refiner>(new GreedyFMRefiner(init_refine_config));
     
     // Get final level constraints for balance checking
-    PartitionConstraints eval_constraints(2, local_config);
-    if (has_custom_constraints) {
-        eval_constraints = *xml_constraints;
-    } else if (use_type_constraints) {
-        eval_constraints.initializeBalancedWithTypes(eval_hg, local_config.imbalance_factor, relaxed_multiplier);
-    } else {
-        eval_constraints.initializeBalanced(eval_hg, local_config.imbalance_factor);
-    }
+    PartitionConstraints eval_constraints = buildLevelConstraints(local_config,
+                                                                  2,
+                                                                  eval_hg,
+                                                                  fixed_constraints,
+                                                                  use_type_constraints,
+                                                                  relaxed_multiplier);
     
     auto runTrial = [&](Partition trial_partition, bool skip_balance_check = false) -> bool {
         // Check initial balance - skip if explicitly allowed (for fallback)
@@ -256,6 +267,8 @@ Partition runDirectBipartition(Hypergraph&& hg,
     bool use_rand = (init_mode == "rand" || init_mode == "all");
     bool use_ghg = (init_mode == "ghg" || init_mode == "all");
     bool use_ghg_opt = (init_mode == "ghg_opt" || init_mode == "all");
+    const bool will_run_ghg = use_ghg && (local_config.num_partitions == 2);
+    const bool will_run_ghg_opt = use_ghg_opt && (local_config.num_partitions == 2);
     
     // Helper lambda to try a partition and enforce balance if needed
     auto tryPartitionWithBalance = [&](Partition trial_partition) -> bool {
@@ -275,7 +288,7 @@ Partition runDirectBipartition(Hypergraph&& hg,
     
     if (use_rand) {
         int kNumRandomTrials = local_config.initial_partition_runs;
-        if (use_ghg || use_ghg_opt) 
+        if (will_run_ghg || will_run_ghg_opt) 
             kNumRandomTrials = 5;
         for (int trial = 0; trial < kNumRandomTrials; ++trial) {
             Configuration trial_config = local_config;
@@ -287,7 +300,7 @@ Partition runDirectBipartition(Hypergraph&& hg,
         }
     }
     
-    if (use_ghg) {
+    if (will_run_ghg) {
         // Run GHG with 5 different seeds
         constexpr int kNumGHGTrials = 5;
         for (int trial = 0; trial < kNumGHGTrials; ++trial) {
@@ -300,7 +313,7 @@ Partition runDirectBipartition(Hypergraph&& hg,
         }
     }
     
-    if (use_ghg_opt) {
+    if (will_run_ghg_opt) {
         // Run GHGOpt with 5 different strategies (different seed selectors)
         constexpr int kNumGHGOptTrials = 5;
         for (int trial = 0; trial < kNumGHGOptTrials; ++trial) {
@@ -348,15 +361,12 @@ Partition runDirectBipartition(Hypergraph&& hg,
         }
         partition = std::move(new_partition);
         
-        PartitionConstraints level_constraints(2, local_config);
-        if (has_custom_constraints) {
-            // Use provided constraints directly (already aggregated for this bipartition)
-            level_constraints = *xml_constraints;
-        } else if (use_type_constraints) {
-            level_constraints.initializeBalancedWithTypes(level_hg, local_config.imbalance_factor, relaxed_multiplier);
-        } else {
-            level_constraints.initializeBalanced(level_hg, local_config.imbalance_factor);
-        }
+        PartitionConstraints level_constraints = buildLevelConstraints(local_config,
+                                                                       2,
+                                                                       level_hg,
+                                                                       fixed_constraints,
+                                                                       use_type_constraints,
+                                                                       relaxed_multiplier);
         refiner->refine(level_hg, partition, level_constraints);
     }
     
@@ -1609,7 +1619,7 @@ int MultilevelPartitionerApp::runDirectPartitioning(Hypergraph& hg, double parse
     coarsen_timer.start();
     
     auto coarsener = createCoarsener(coarsen_algo_, config_);
-    MultilevelCoarsener ml_coarsener(config_, std::move(coarsener));
+    MultilevelCoarsener ml_coarsener(std::move(coarsener));
     HypergraphHierarchy hierarchy = ml_coarsener.coarsen(std::move(hg));
     
     coarsen_timer.stop();
@@ -1630,15 +1640,15 @@ int MultilevelPartitionerApp::runDirectPartitioning(Hypergraph& hg, double parse
     std::cout << "Each trial will be refined through " << num_trial_refine_levels 
               << " levels before comparison" << std::endl;
     
-    PartitionConstraints coarsest_constraints(config_.num_partitions, config_);
-    if (use_xml_constraints_ && xml_constraints_) {
-        // Use cached XML constraints (same capacity at all levels)
-        coarsest_constraints = *xml_constraints_;
-    } else if (use_type_constraints_) {
-        coarsest_constraints.initializeBalancedWithTypes(coarsest_hg, config_.imbalance_factor, relaxed_multiplier_);
-    } else {
-        coarsest_constraints.initializeBalanced(coarsest_hg, config_.imbalance_factor);
-    }
+    const PartitionConstraints* fixed_constraints = (use_xml_constraints_ && xml_constraints_)
+                                                    ? xml_constraints_.get()
+                                                    : nullptr;
+    PartitionConstraints coarsest_constraints = buildLevelConstraints(config_,
+                                                                      config_.num_partitions,
+                                                                      coarsest_hg,
+                                                                      fixed_constraints,
+                                                                      use_type_constraints_,
+                                                                      relaxed_multiplier_);
     
     int best_trial_level = coarsest_level;
     Partition partition = runInitialPartitioning(hierarchy, coarsest_level, coarsest_constraints,
@@ -1676,15 +1686,12 @@ int MultilevelPartitionerApp::runDirectPartitioning(Hypergraph& hg, double parse
         }
         partition = new_partition;
         
-        PartitionConstraints level_constraints(config_.num_partitions, config_);
-        if (use_xml_constraints_ && xml_constraints_) {
-            // Use cached XML constraints (same capacity at all levels)
-            level_constraints = *xml_constraints_;
-        } else if (use_type_constraints_) {
-            level_constraints.initializeBalancedWithTypes(level_hg, config_.imbalance_factor, relaxed_multiplier_);
-        } else {
-            level_constraints.initializeBalanced(level_hg, config_.imbalance_factor);
-        }
+        PartitionConstraints level_constraints = buildLevelConstraints(config_,
+                                                                       config_.num_partitions,
+                                                                       level_hg,
+                                                                       fixed_constraints,
+                                                                       use_type_constraints_,
+                                                                       relaxed_multiplier_);
         
         RefinementStats stats = refiner->refine(level_hg, partition, level_constraints);
         refine_stats.push_back(stats);
@@ -1743,38 +1750,38 @@ Partition MultilevelPartitionerApp::runInitialPartitioning(
     Partition best_imbalanced_partition(eval_hg.getNumNodes(), config_.num_partitions);
     Weight best_imbalanced_cut = std::numeric_limits<Weight>::max();
     best_trial_level = coarsest_level;
+    const PartitionConstraints* fixed_constraints = coarsest_constraints.isXMLConstraintMode()
+                                                    ? &coarsest_constraints
+                                                    : nullptr;
     
     // Pre-create level constraints
     std::vector<PartitionConstraints> level_constraints_cache;
     level_constraints_cache.reserve(num_trial_refine_levels + 1);
     for (int level = coarsest_level; level >= trial_stop_level; --level) {
         const Hypergraph& level_hg = hierarchy.getLevel(level).getHypergraph();
-        PartitionConstraints constraints(config_.num_partitions, config_);
-        if (coarsest_constraints.isXMLConstraintMode()) {
-            // Use same XML constraints at all levels
-            constraints = coarsest_constraints;
-        } else if (use_type_constraints) {
-            constraints.initializeBalancedWithTypes(level_hg, config_.imbalance_factor, relaxed_multiplier);
-        } else {
-            constraints.initializeBalanced(level_hg, config_.imbalance_factor);
-        }
+        PartitionConstraints constraints = buildLevelConstraints(config_,
+                                                                 config_.num_partitions,
+                                                                 level_hg,
+                                                                 fixed_constraints,
+                                                                 use_type_constraints,
+                                                                 relaxed_multiplier);
         level_constraints_cache.push_back(std::move(constraints));
     }
     
     // Get eval level constraints for balance checking
-    PartitionConstraints eval_constraints(config_.num_partitions, config_);
-    if (coarsest_constraints.isXMLConstraintMode()) {
-        eval_constraints = coarsest_constraints;
-    } else if (use_type_constraints) {
-        eval_constraints.initializeBalancedWithTypes(eval_hg, config_.imbalance_factor, relaxed_multiplier);
-    } else {
-        eval_constraints.initializeBalanced(eval_hg, config_.imbalance_factor);
-    }
+    PartitionConstraints eval_constraints = buildLevelConstraints(config_,
+                                                                  config_.num_partitions,
+                                                                  eval_hg,
+                                                                  fixed_constraints,
+                                                                  use_type_constraints,
+                                                                  relaxed_multiplier);
     
     bool use_rand = (init_mode == "rand" || init_mode == "all");
     bool use_ghg = (init_mode == "ghg" || init_mode == "all");
     bool use_ghg_opt = (init_mode == "ghg_opt" || init_mode == "all");
-    
+    const bool will_run_ghg = use_ghg && (config_.num_partitions == 2);
+    const bool will_run_ghg_opt = use_ghg_opt && (config_.num_partitions == 2);
+
     int valid_trials = 0;
     int discarded_trials = 0;
     int total_trials = 0;
@@ -1900,10 +1907,15 @@ Partition MultilevelPartitionerApp::runInitialPartitioning(
 
     std::vector<TrialInput> trial_inputs;
     trial_inputs.reserve(static_cast<size_t>(config_.initial_partition_runs + 16));
+    auto appendTrialInput = [&](const std::string& method_name, int trial_idx, Partition&& trial_partition) {
+        trial_inputs.push_back(TrialInput(method_name, trial_idx, std::move(trial_partition)));
+    };
     
     if (use_rand) {
         int kNumRandomTrials = config_.initial_partition_runs;
-        if (use_ghg || use_ghg_opt) 
+        // Only reduce random trials when extra bipartition-only initializers
+        // will actually run in this configuration.
+        if (will_run_ghg || will_run_ghg_opt)
             kNumRandomTrials = 5;
         for (int trial = 0; trial < kNumRandomTrials; ++trial) {
             Configuration trial_config = config_;
@@ -1911,11 +1923,11 @@ Partition MultilevelPartitionerApp::runInitialPartitioning(
             
             RandomPartitioner random_partitioner(trial_config);
             Partition trial_partition = random_partitioner.partition(coarsest_hg, coarsest_constraints);
-            trial_inputs.push_back(TrialInput("Random", trial, std::move(trial_partition)));
+            appendTrialInput("Random", trial, std::move(trial_partition));
         }
     }
     
-    if (use_ghg && config_.num_partitions == 2) {
+    if (will_run_ghg) {
         // Run GHG with 5 different seeds
         constexpr int kNumGHGTrials = 5;
         for (int trial = 0; trial < kNumGHGTrials; ++trial) {
@@ -1924,11 +1936,11 @@ Partition MultilevelPartitionerApp::runInitialPartitioning(
             
             GHGPartitioner ghg_partitioner(trial_config);
             Partition ghg_partition = ghg_partitioner.partition(coarsest_hg, coarsest_constraints);
-            trial_inputs.push_back(TrialInput("GHG", trial, std::move(ghg_partition)));
+            appendTrialInput("GHG", trial, std::move(ghg_partition));
         }
     }
     
-    if (use_ghg_opt && config_.num_partitions == 2) {
+    if (will_run_ghg_opt) {
         // Run GHGOpt with 5 different strategies
         constexpr int kNumGHGOptTrials = 5;
         for (int trial = 0; trial < kNumGHGOptTrials; ++trial) {
@@ -1937,7 +1949,7 @@ Partition MultilevelPartitionerApp::runInitialPartitioning(
             
             GHGOptPartitioner ghg_opt_partitioner(trial_config);
             Partition ghg_opt_partition = ghg_opt_partitioner.partition(coarsest_hg, coarsest_constraints);
-            trial_inputs.push_back(TrialInput("GHG_Opt", trial, std::move(ghg_opt_partition)));
+            appendTrialInput("GHG_Opt", trial, std::move(ghg_opt_partition));
         }
     }
 
@@ -1949,7 +1961,7 @@ Partition MultilevelPartitionerApp::runInitialPartitioning(
                   << "running greedy fallback." << std::endl;
         GreedyPartitioner greedy_partitioner(config_);
         Partition greedy_partition = greedy_partitioner.partition(coarsest_hg, coarsest_constraints);
-        trial_inputs.push_back(TrialInput("GreedyFallback", 0, std::move(greedy_partition)));
+        appendTrialInput("GreedyFallback", 0, std::move(greedy_partition));
         inserted_fallback_due_empty_inputs = true;
     }
 
@@ -1977,9 +1989,7 @@ Partition MultilevelPartitionerApp::runInitialPartitioning(
     // Optional detailed violation dump for debugging. Disabled by default for runtime.
     const bool print_trial_violations = (std::getenv("CONSMLP_PRINT_TRIAL_VIOLATIONS") != nullptr);
 
-    // Unified result handling in deterministic trial order.
-    for (size_t i = 0; i < trial_results.size(); ++i) {
-        TrialResult& result = trial_results[i];
+    auto processTrialResult = [&](const TrialResult& result) {
         if (result.starts_imbalanced && !result.start_balance_fixed) {
             std::cout << result.method_name << " trial " << result.trial_idx
                       << " starts imbalanced; keeping as fallback candidate" << std::endl;
@@ -1996,7 +2006,7 @@ Partition MultilevelPartitionerApp::runInitialPartitioning(
                 eval_constraints.printConstraintViolations(result.partition, eval_hg);
             }
             discarded_trials++;
-            continue;
+            return;
         }
 
         std::cout << result.method_name << " trial " << result.trial_idx
@@ -2008,6 +2018,11 @@ Partition MultilevelPartitionerApp::runInitialPartitioning(
             best_trial_level = trial_stop_level;
         }
         valid_trials++;
+    };
+
+    // Unified result handling in deterministic trial order.
+    for (size_t i = 0; i < trial_results.size(); ++i) {
+        processTrialResult(trial_results[i]);
     }
 
     // Preserve original behavior: if no valid trial was found, run one greedy
@@ -2021,34 +2036,7 @@ Partition MultilevelPartitionerApp::runInitialPartitioning(
         TrialInput greedy_input("GreedyFallback", 0, std::move(greedy_partition));
         TrialResult greedy_result = evaluateTrial(greedy_input);
         total_trials++;
-
-        if (greedy_result.starts_imbalanced && !greedy_result.start_balance_fixed) {
-            std::cout << greedy_result.method_name << " trial " << greedy_result.trial_idx
-                      << " starts imbalanced; keeping as fallback candidate" << std::endl;
-        }
-
-        if (!greedy_result.valid) {
-            if (greedy_result.final_cut < best_imbalanced_cut) {
-                best_imbalanced_cut = greedy_result.final_cut;
-                best_imbalanced_partition = greedy_result.partition;
-            }
-            std::cout << greedy_result.method_name << " trial " << greedy_result.trial_idx
-                      << " discarded (final imbalance)" << std::endl;
-            if (print_trial_violations) {
-                eval_constraints.printConstraintViolations(greedy_result.partition, eval_hg);
-            }
-            discarded_trials++;
-        } else {
-            std::cout << greedy_result.method_name << " trial " << greedy_result.trial_idx
-                      << " cut: " << greedy_result.initial_cut << " -> " << greedy_result.final_cut
-                      << " (improve: " << (greedy_result.initial_cut - greedy_result.final_cut) << ")" << std::endl;
-            if (greedy_result.final_cut < best_cut) {
-                best_cut = greedy_result.final_cut;
-                best_partition = greedy_result.partition;
-                best_trial_level = trial_stop_level;
-            }
-            valid_trials++;
-        }
+        processTrialResult(greedy_result);
     }
 
     if (best_cut == std::numeric_limits<Weight>::max() &&

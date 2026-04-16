@@ -75,8 +75,7 @@ ClusterMatching::ClusterMatching(const Configuration& config)
 }
 
 CoarseningStats ClusterMatching::coarsen(HypergraphHierarchy& hierarchy,
-                                         uint32_t level_idx,
-                                         Profiler* profiler) {
+                                         uint32_t level_idx) {
     CoarseningStats stats;
     curr_level_idx_ = level_idx;
     HypergraphLevel& fine_level = hierarchy.getLevel(curr_level_idx_);

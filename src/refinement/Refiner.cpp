@@ -111,15 +111,6 @@ bool GreedyFMRefiner::GainBucket::getMax(NodeID& node_id, int& gain) {
     return false;
 }
 
-void GreedyFMRefiner::GainBucket::clear() {
-    for (auto& bucket : buckets_) {
-        bucket.clear();
-    }
-    std::fill(node_in_bucket_.begin(), node_in_bucket_.end(), false);
-    size_ = 0;
-    max_current_gain_ = min_gain_ - 1;
-}
-
 GreedyFMRefiner::GreedyFMRefiner(const Configuration& config)
     : Refiner(config)
 {
@@ -203,11 +194,23 @@ Weight GreedyFMRefiner::performPass(const Hypergraph& hg,
     size_t m_threshold = 0;
     bool first_negative_seen = false;
     
+    struct PoppedCandidate {
+        PartitionID from_part;
+        NodeID node;
+        int gain;
+
+        PoppedCandidate(PartitionID p, NodeID n, int g)
+            : from_part(p), node(n), gain(g) {}
+    };
+
     // Main FM loop
     for (size_t move_count = 0; move_count < max_moves; ++move_count) {
         NodeID best_node = INVALID_NODE;
         PartitionID best_to_partition = INVALID_PARTITION;
-        int best_gain = std::numeric_limits<int>::min();
+        int best_exact_gain = std::numeric_limits<int>::min();
+        int best_estimated_gain = std::numeric_limits<int>::min();
+        std::vector<PoppedCandidate> popped_candidates;
+        popped_candidates.reserve(num_partitions);
         
         // Find best node from gain buckets
         for (PartitionID from_part = 0; from_part < num_partitions; ++from_part) {
@@ -220,6 +223,7 @@ Weight GreedyFMRefiner::performPass(const Hypergraph& hg,
             
             if (gain_buckets_[from_part].getMax(candidate_node, candidate_gain)) {
                 if (locked_[candidate_node]) continue;
+                popped_candidates.emplace_back(from_part, candidate_node, candidate_gain);
                 
                 PartitionID current_part = partition.getPartition(candidate_node);
                 
@@ -230,17 +234,26 @@ Weight GreedyFMRefiner::performPass(const Hypergraph& hg,
                         continue;
                     }
                     
-                    int gain = computeGain(hg, partition, candidate_node, to_part);
+                    int estimated_gain = computeGain(hg, partition, candidate_node, to_part);
+                    int exact_gain = computeExactMoveGain(hg, partition, candidate_node, to_part);
                     
-                    if (gain > best_gain) {
-                        best_gain = gain;
+                    if (exact_gain > best_exact_gain ||
+                        (exact_gain == best_exact_gain && estimated_gain > best_estimated_gain)) {
+                        best_exact_gain = exact_gain;
+                        best_estimated_gain = estimated_gain;
                         best_node = candidate_node;
                         best_to_partition = to_part;
-                        
-                        if (gain > 100) break;
                     }
                 }
             }
+        }
+
+        for (size_t i = 0; i < popped_candidates.size(); ++i) {
+            const PoppedCandidate& popped = popped_candidates[i];
+            if (popped.node == best_node || locked_[popped.node]) {
+                continue;
+            }
+            gain_buckets_[popped.from_part].insert(popped.node, popped.gain);
         }
         
         if (best_node == INVALID_NODE) {
@@ -252,9 +265,9 @@ Weight GreedyFMRefiner::performPass(const Hypergraph& hg,
         partition.moveNode(best_node, best_to_partition, hg);
         locked_[best_node] = true;
         
-        moves.emplace_back(best_node, from_partition, best_to_partition, best_gain);
+        moves.emplace_back(best_node, from_partition, best_to_partition, best_exact_gain);
         
-        current_cut_delta += best_gain;
+        current_cut_delta += best_exact_gain;
         
         if (current_cut_delta > best_cut_delta) {
             best_cut_delta = current_cut_delta;
@@ -262,7 +275,7 @@ Weight GreedyFMRefiner::performPass(const Hypergraph& hg,
             negative_move_count = 0;
         }
         
-        if (best_gain < 0) {
+        if (best_exact_gain < 0) {
             if (!first_negative_seen) {
                 first_negative_seen = true;
                 m_threshold = move_count;
@@ -280,7 +293,7 @@ Weight GreedyFMRefiner::performPass(const Hypergraph& hg,
                 } else if (pass_number <= 2) {
                     if (negative_move_count >= 5 * m_threshold) break;
                 } else {
-                    if (best_gain < 0) break;
+                    if (best_exact_gain < 0) break;
                 }
             }
         } else {
@@ -291,7 +304,7 @@ Weight GreedyFMRefiner::performPass(const Hypergraph& hg,
                 } else if (pass_number <= 2) {
                     if (negative_move_count >= 15 * m_threshold) break;
                 } else {
-                    if (best_gain < 0) break;
+                    if (best_exact_gain < 0) break;
                 }
             }
         }
@@ -301,7 +314,7 @@ Weight GreedyFMRefiner::performPass(const Hypergraph& hg,
         updateNeighborGainsAndAddToBucket(hg, partition, best_node);
     }
     
-    // Undo moves after best point (based on estimated gain)
+    // Undo moves after best point (tracked on exact cut gain trajectory)
     for (size_t i = moves.size(); i > best_move_index; --i) {
         const auto& move = moves[i - 1];
         partition.moveNode(move.node_id, move.from_partition, hg);
@@ -371,14 +384,18 @@ void GreedyFMRefiner::initializeBoundaryGains(const Hypergraph& hg,
         
         PartitionID current_part = partition.getPartition(node_id);
         
-        // Compute gain for moving to another partition
+        // Compute the best gain across all candidate target partitions.
+        int best_gain = std::numeric_limits<int>::min();
+        bool has_target = false;
         for (PartitionID to_part = 0; to_part < num_partitions; ++to_part) {
             if (to_part == current_part) continue;
-            
+            has_target = true;
             int gain = computeGain(hg, partition, node_id, to_part);
-            gain_buckets_[current_part].insert(node_id, gain);
+            best_gain = std::max(best_gain, gain);
+        }
+        if (has_target) {
+            gain_buckets_[current_part].insert(node_id, best_gain);
             in_bucket_[node_id] = true;
-            break;  // Only consider one target partition for simplicity
         }
     }
 }
@@ -425,6 +442,63 @@ int GreedyFMRefiner::computeGain(const Hypergraph& hg,
         }
     }
     
+    return gain;
+}
+
+int GreedyFMRefiner::computeExactMoveGain(const Hypergraph& hg,
+                                          const Partition& partition,
+                                          NodeID node_id,
+                                          PartitionID to_partition) const {
+    PartitionID from_partition = partition.getPartition(node_id);
+    if (from_partition == INVALID_PARTITION || from_partition == to_partition) {
+        return 0;
+    }
+
+    int gain = 0;
+    auto nets = hg.getNodeNets(node_id);
+
+    for (const EdgeID* net_it = nets.first; net_it != nets.second; ++net_it) {
+        EdgeID net_id = *net_it;
+        if (hg.isNetGlobal(net_id)) {
+            continue;
+        }
+
+        auto nodes = hg.getNetNodes(net_id);
+        PartitionID first_before = INVALID_PARTITION;
+        PartitionID first_after = INVALID_PARTITION;
+        bool is_cut_before = false;
+        bool is_cut_after = false;
+
+        for (const NodeID* node_it = nodes.first; node_it != nodes.second; ++node_it) {
+            NodeID curr_node = *node_it;
+            PartitionID part_before = partition.getPartition(curr_node);
+            PartitionID part_after = (curr_node == node_id) ? to_partition : part_before;
+
+            if (first_before == INVALID_PARTITION) {
+                first_before = part_before;
+            } else if (part_before != first_before) {
+                is_cut_before = true;
+            }
+
+            if (first_after == INVALID_PARTITION) {
+                first_after = part_after;
+            } else if (part_after != first_after) {
+                is_cut_after = true;
+            }
+
+            if (is_cut_before && is_cut_after) {
+                break;
+            }
+        }
+
+        Weight net_weight = hg.getNetWeight(net_id);
+        if (is_cut_before && !is_cut_after) {
+            gain += net_weight;
+        } else if (!is_cut_before && is_cut_after) {
+            gain -= net_weight;
+        }
+    }
+
     return gain;
 }
 
@@ -489,12 +563,33 @@ bool GreedyFMRefiner::isValidMove(const Hypergraph& hg,
     if (hg.isNodeFixed(node_id)) {
         return false;
     }
-    
-    // Check capacity constraints for all types
+
+    PartitionID from_partition = partition.getPartition(node_id);
+    if (from_partition == INVALID_PARTITION || from_partition == to_partition) {
+        return false;
+    }
+
+    // Check target upper-bound constraints for all types.
     const TypeWeights& type_weights = hg.getNodeTypeWeights(node_id);
-    
-    return !constraints.wouldViolateCapacityMultiType(to_partition, type_weights, partition);
+    if (constraints.wouldViolateCapacityMultiType(to_partition, type_weights, partition)) {
+        return false;
+    }
+
+    // Check source lower-bound constraints so a move cannot underflow min capacity.
+    for (size_t t = 0; t < NUM_NODE_TYPES; ++t) {
+        if (type_weights[t] <= 0) {
+            continue;
+        }
+        NodeType type = static_cast<NodeType>(t);
+        CapacityConstraint src_constraint = constraints.getCapacity(from_partition, type);
+        Weight src_current = partition.getPartitionWeightByType(from_partition, type);
+        Weight src_after_move = src_current - type_weights[t];
+        if (src_after_move < src_constraint.min_capacity) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 } // namespace consmlp
-

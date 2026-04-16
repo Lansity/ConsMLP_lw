@@ -16,12 +16,11 @@ struct RefinementStats {
     Weight initial_cut;
     Weight final_cut;
     Weight improvement;
-    uint32_t num_moves;
     uint32_t num_passes;
 
     RefinementStats()
         : initial_cut(0), final_cut(0), improvement(0)
-        , num_moves(0), num_passes(0)
+        , num_passes(0)
     {}
 };
 
@@ -114,11 +113,6 @@ private:
         bool getMax(NodeID& node_id, int& gain);
 
         bool empty() const { return size_ == 0; }
-        void clear();
-
-        bool contains(NodeID node_id) const {
-            return node_id < node_in_bucket_.size() && node_in_bucket_[node_id];
-        }
 
     private:
         int min_gain_;
@@ -180,6 +174,19 @@ private:
                     const Partition& partition,
                     NodeID node_id,
                     PartitionID to_partition) const;
+
+    /**
+     * @brief Compute exact cut gain using full cut metric semantics.
+     * @param hg Hypergraph
+     * @param partition Current partition
+     * @param node_id Node to evaluate
+     * @param to_partition Target partition
+     * @return Exact gain value (positive = cut reduction)
+     */
+    int computeExactMoveGain(const Hypergraph& hg,
+                             const Partition& partition,
+                             NodeID node_id,
+                             PartitionID to_partition) const;
 
     /**
      * @brief Update neighbor gains and lazily add new boundary nodes to bucket

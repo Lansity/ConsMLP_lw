@@ -3,7 +3,6 @@
 
 #include "Coarsener.h"
 #include "datastructures/HypergraphHierarchy.h"
-#include "utils/Configuration.h"
 #include <memory>
 #include <vector>
 
@@ -21,11 +20,9 @@ class MultilevelCoarsener {
 public:
     /**
      * @brief Constructor
-     * @param config Configuration
      * @param coarsener Coarsening algorithm to use
      */
-    MultilevelCoarsener(const Configuration& config,
-                       std::unique_ptr<Coarsener> coarsener);
+    explicit MultilevelCoarsener(std::unique_ptr<Coarsener> coarsener);
     
     /**
      * @brief Perform multilevel coarsening
@@ -43,25 +40,11 @@ public:
         return stats_;
     }
     
-    /**
-     * @brief Print coarsening summary
-     */
-    void printSummary() const;
-
 private:
-    Configuration config_;
     std::unique_ptr<Coarsener> coarsener_;
     std::vector<CoarseningStats> stats_;
-    
-    /**
-     * @brief Check if contraction ratio is acceptable
-     * @param stats Coarsening statistics
-     * @return True if ratio in range [1.5, 1.7]
-     */
-    bool isContractionRatioGood(const CoarseningStats& stats) const;
 };
 
 } // namespace consmlp
 
 #endif // ZXPART_MULTILEVEL_COARSENER_H
-
